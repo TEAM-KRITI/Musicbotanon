@@ -166,7 +166,7 @@ class Inline:
         rows = [
             [
                 self.ikb(
-                    text=lang["⌯ ʌᴅᴅ ϻє ⌯"],
+                    text=lang["add_me"],
                     url=f"https://t.me/{app.username}?startgroup=true",
                     style=enums.ButtonStyle.PRIMARY,
                 )
