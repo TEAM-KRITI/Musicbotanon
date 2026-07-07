@@ -181,7 +181,7 @@ class Inline:
                 ],
                 [
                     self.ikb(
-                        text=lang["sᴏᴜʀᴄᴇ"],
+                        text=lang["source"],
                         url="https://github.com/yjee4247-code/kirtipublic",
                         style=enums.ButtonStyle.DANGER,
                     )
