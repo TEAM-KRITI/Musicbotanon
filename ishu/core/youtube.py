@@ -57,11 +57,19 @@ def _extract_video_id(link: str) -> str | None:
 async def _railway_download(video_id: str, media_type: str) -> str | None:
     """
     Download via Railway self-hosted YouTube API.
-    GET {RAILWAY_YT_API_URL}/play/audio?id=<video_id>            (audio)
-    GET {RAILWAY_YT_API_URL}/play/video/hq?id=<video_id>         (video, preferred)
-    GET {RAILWAY_YT_API_URL}/play/video?id=<video_id>            (video, fallback)
-    RAILWAY_YT_API_KEY is optional — omitted from params when not set.
-    Streams bytes directly to a local file.
+
+    Auth: X-API-Key header (RAILWAY_YT_API_KEY) — optional if API is open.
+
+    Audio flow:
+      1. GET /play/audio?id=<id>  → proxied byte stream (200 = direct file)
+      2. GET /audio?id=<id>       → JSON {"success": true, "audio": {"best_audio": {"url": "..."}}}
+                                     then stream that URL
+
+    Video flow:
+      1. GET /play/video/hq?id=<id> → proxied byte stream
+      2. GET /video/hq?id=<id>      → JSON {"success": true, "stream": {"url": "..."}}
+                                       then stream that URL
+
     Returns local file path on success, None on failure.
     """
     if not RAILWAY_YT_API_URL:
@@ -76,34 +84,100 @@ async def _railway_download(video_id: str, media_type: str) -> str | None:
     if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
         return file_path
 
+    # Auth goes in the X-API-Key header, not as a query param
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
-    endpoints = ["play/video/hq", "play/video"] if media_type == "video" else ["play/audio"]
+    if RAILWAY_YT_API_KEY:
+        headers["X-API-Key"] = str(RAILWAY_YT_API_KEY)
+
+    params = {"id": video_id}
+
+    async def _stream_to_file(session: aiohttp.ClientSession, url: str) -> bool:
+        """Stream bytes from url directly into file_path. Returns True on success."""
+        try:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=timeout_dl)
+            ) as resp:
+                if resp.status == 200:
+                    with open(file_path, "wb") as fobj:
+                        async for chunk in resp.content.iter_chunked(1024 * 1024):
+                            fobj.write(chunk)
+                    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                        return True
+                else:
+                    logger.warning("Railway YT API %s → %s for %s", url.split("/")[-1], resp.status, video_id)
+        except Exception as exc:
+            logger.warning("Railway YT API stream error for %s: %s", video_id, exc)
+        return False
 
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
-            for endpoint in endpoints:
-                # Build params — only include api_key when it is actually set
-                params: dict = {"id": video_id}
-                if RAILWAY_YT_API_KEY:
-                    params["api_key"] = str(RAILWAY_YT_API_KEY)
+            if media_type == "audio":
+                # Step 1: try the proxy endpoint (direct byte stream)
+                if await _stream_to_file(session, f"{RAILWAY_YT_API_URL}/play/audio"):
+                    logger.info("Railway YT API ✓ /play/audio %s → %s", video_id, file_path)
+                    return file_path
 
+                # Step 2: fallback — get JSON, extract best_audio URL, then stream it
                 async with session.get(
-                    f"{RAILWAY_YT_API_URL}/{endpoint}",
+                    f"{RAILWAY_YT_API_URL}/audio",
                     params=params,
-                    timeout=aiohttp.ClientTimeout(total=timeout_dl),
+                    timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
                     if resp.status == 200:
-                        with open(file_path, "wb") as fobj:
-                            async for chunk in resp.content.iter_chunked(1024 * 1024):
-                                fobj.write(chunk)
-
-                        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                            logger.info("Railway YT API ✓ %s → %s", video_id, file_path)
-                            return file_path
+                        data = await resp.json(content_type=None)
+                        stream_url = (
+                            (data.get("audio") or {})
+                            .get("best_audio", {})
+                            .get("url")
+                        )
+                        if stream_url:
+                            async with session.get(
+                                stream_url,
+                                timeout=aiohttp.ClientTimeout(total=timeout_dl),
+                                allow_redirects=True,
+                            ) as file_resp:
+                                if file_resp.status == 200:
+                                    with open(file_path, "wb") as fobj:
+                                        async for chunk in file_resp.content.iter_chunked(1024 * 1024):
+                                            fobj.write(chunk)
+                                    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                                        logger.info("Railway YT API ✓ /audio+stream %s → %s", video_id, file_path)
+                                        return file_path
                     else:
-                        logger.warning("Railway YT API /%s status %s for %s", endpoint, resp.status, video_id)
+                        logger.warning("Railway YT API /audio status %s for %s", resp.status, video_id)
+
+            else:  # video
+                # Step 1: try the proxy endpoint
+                if await _stream_to_file(session, f"{RAILWAY_YT_API_URL}/play/video/hq"):
+                    logger.info("Railway YT API ✓ /play/video/hq %s → %s", video_id, file_path)
+                    return file_path
+
+                # Step 2: fallback — get JSON stream URL
+                async with session.get(
+                    f"{RAILWAY_YT_API_URL}/video/hq",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        stream_url = (data.get("stream") or {}).get("url")
+                        if stream_url:
+                            async with session.get(
+                                stream_url,
+                                timeout=aiohttp.ClientTimeout(total=timeout_dl),
+                                allow_redirects=True,
+                            ) as file_resp:
+                                if file_resp.status == 200:
+                                    with open(file_path, "wb") as fobj:
+                                        async for chunk in file_resp.content.iter_chunked(1024 * 1024):
+                                            fobj.write(chunk)
+                                    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                                        logger.info("Railway YT API ✓ /video/hq+stream %s → %s", video_id, file_path)
+                                        return file_path
+                    else:
+                        logger.warning("Railway YT API /video/hq status %s for %s", resp.status, video_id)
 
         return None
 
@@ -115,6 +189,7 @@ async def _railway_download(video_id: str, media_type: str) -> str | None:
         except OSError:
             pass
         return None
+
 
 
 # ── Main download entrypoint ──────────────────────────────────────────────────
