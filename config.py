@@ -28,6 +28,11 @@ class Config:
         self.YTPROXY_URL = getenv("YTPROXY_URL", "https://tgapi.xbitcode.com")  # xBit Music Endpoint
         self.YT_API_KEY = getenv("YT_API_KEY", "")  # Get from https://t.me/tgmusic_apibot
 
+        # Optional: yt-dlp PO Token & Visitor Data to bypass YouTube bot-detection
+        # See: https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
+        self.YT_PO_TOKEN     = getenv("YT_PO_TOKEN",     None)
+        self.YT_VISITOR_DATA = getenv("YT_VISITOR_DATA", None)
+
         # Railway self-hosted YouTube API
         self.RAILWAY_YT_API_URL = getenv("RAILWAY_YT_API_URL", "")
         self.RAILWAY_YT_API_KEY = getenv("RAILWAY_YT_API_KEY", "")

@@ -35,7 +35,14 @@ RAILWAY_YT_API_KEY  = getattr(config, "RAILWAY_YT_API_KEY",  None)
 YTPROXY_URL         = getattr(config, "YTPROXY_URL",         None)
 YT_API_KEY          = getattr(config, "YT_API_KEY",          None)
 
+# PO Token / Visitor Data for yt-dlp bot-check bypass (optional but recommended)
+YT_PO_TOKEN         = getattr(config, "YT_PO_TOKEN",         None)
+YT_VISITOR_DATA     = getattr(config, "YT_VISITOR_DATA",     None)
+
 DOWNLOAD_DIR        = "downloads"
+
+# yt-dlp player clients tried in order — android/ios bypass YouTube bot-checks
+_YTDLP_CLIENTS = ["android", "ios", "web_creator"]
 
 
 # ── Cookie helper ─────────────────────────────────────────────────────────────
@@ -269,9 +276,56 @@ async def _xbit_download(link: str, media_type: str) -> str | None:
 
 
 # ── Downloader 4: yt-dlp (local fallback) ────────────────────────────────────
+def _build_ydl_opts(
+    file_path: str,
+    media_type: str,
+    client: str,
+    cookie: str | None,
+) -> dict:
+    """
+    Build yt-dlp options for a given player client.
+    android / ios clients bypass YouTube's bot-check without requiring cookies.
+    PO_TOKEN / VISITOR_DATA are injected when configured for extra resilience.
+    """
+    extractor_args = {"youtube": {"player_client": [client]}}
+
+    # Inject PO token when available (web client only needs it, but doesn't hurt others)
+    if YT_PO_TOKEN and YT_VISITOR_DATA:
+        extractor_args["youtube"]["po_token"] = [f"web+{YT_PO_TOKEN}"]
+        extractor_args["youtube"]["visitor_data"] = [YT_VISITOR_DATA]
+
+    base: dict = {
+        "quiet":           True,
+        "no_warnings":     True,
+        "outtmpl":         file_path,
+        "extractor_args":  extractor_args,
+        # Retries with exponential back-off help against transient 403s
+        "retries":         5,
+        "fragment_retries": 5,
+        "socket_timeout":  30,
+    }
+    if cookie:
+        base["cookiefile"] = cookie
+
+    if media_type == "video":
+        base["format"]              = "bestvideo[height<=720]+bestaudio/best[height<=720]"
+        base["merge_output_format"] = "mp4"
+    else:
+        base["format"]        = "bestaudio/best"
+        base["postprocessors"] = [{
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
+            "preferredquality": "192",
+        }]
+
+    return base
+
+
 async def _ytdlp_download(link: str, media_type: str) -> str | None:
     """
     Last-resort local yt-dlp download.
+    Tries multiple player clients (android → ios → web_creator) to bypass
+    YouTube bot-detection before falling back to cookie-based auth.
     Returns local file path or None.
     """
     video_id  = _extract_video_id(link) or link
@@ -282,54 +336,54 @@ async def _ytdlp_download(link: str, media_type: str) -> str | None:
     if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
         return file_path
 
-    cookie = cookie_txt_file()
+    cookie   = cookie_txt_file()
+    url      = _normalize_youtube_link(link)
+    loop     = asyncio.get_event_loop()
 
-    try:
-        if media_type == "video":
-            ydl_opts = {
-                "format":           "bestvideo[height<=720]+bestaudio/best[height<=720]",
-                "outtmpl":          file_path,
-                "quiet":            True,
-                "no_warnings":      True,
-                "cookiefile":       cookie,
-                "merge_output_format": "mp4",
-            }
-        else:
-            ydl_opts = {
-                "format":           "bestaudio/best",
-                "outtmpl":          file_path,
-                "quiet":            True,
-                "no_warnings":      True,
-                "cookiefile":       cookie,
-                "postprocessors":   [{
-                    "key":            "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-            }
+    # Candidate output paths yt-dlp might create
+    candidates = [
+        file_path,
+        file_path.replace(f".{ext}", f".{ext}.{ext}"),
+        # yt-dlp sometimes writes .webm before ffmpeg converts
+        file_path.replace(f".{ext}", ".webm"),
+    ]
 
-        loop = asyncio.get_event_loop()
-        def _run():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([_normalize_youtube_link(link)])
-
-        await loop.run_in_executor(None, _run)
-
-        # yt-dlp may append .mp3 / .mp4 extension
-        candidates = [
-            file_path,
-            file_path.replace(f".{ext}", f".{ext}.{ext}"),
-        ]
+    for client in _YTDLP_CLIENTS:
+        # Clean up any partial file from a previous attempt
         for c in candidates:
-            if os.path.exists(c) and os.path.getsize(c) > 0:
-                logger.info("yt-dlp ✓ %s → %s", video_id, c)
-                return c
+            try:
+                if os.path.exists(c) and os.path.getsize(c) == 0:
+                    os.remove(c)
+            except OSError:
+                pass
 
-        return None
+        ydl_opts = _build_ydl_opts(file_path, media_type, client, cookie)
 
-    except Exception as exc:
-        logger.warning("yt-dlp download failed for %s: %s", video_id, exc)
-        return None
+        try:
+            logger.info("yt-dlp attempting client=%s for %s", client, video_id)
+
+            def _run(opts=ydl_opts):
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+
+            await loop.run_in_executor(None, _run)
+
+            for c in candidates:
+                if os.path.exists(c) and os.path.getsize(c) > 0:
+                    logger.info("yt-dlp ✓ client=%s %s → %s", client, video_id, c)
+                    return c
+
+            logger.warning("yt-dlp client=%s produced no output for %s", client, video_id)
+
+        except Exception as exc:
+            err = str(exc)
+            logger.warning("yt-dlp client=%s failed for %s: %s", client, video_id, err)
+            # If it's not a bot/auth error, no point trying other clients
+            if "bot" not in err.lower() and "sign in" not in err.lower() and "403" not in err:
+                break
+
+    logger.warning("yt-dlp: all clients exhausted for %s", video_id)
+    return None
 
 
 # ── Main download entrypoint ──────────────────────────────────────────────────
