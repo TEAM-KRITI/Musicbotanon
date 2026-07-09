@@ -57,14 +57,15 @@ def _extract_video_id(link: str) -> str | None:
 async def _railway_download(video_id: str, media_type: str) -> str | None:
     """
     Download via Railway self-hosted YouTube API.
-    GET {RAILWAY_YT_API_URL}/play/audio?id=<video_id>   (audio)
-    GET {RAILWAY_YT_API_URL}/play/video/hq?id=<video_id> (video, preferred)
-    GET {RAILWAY_YT_API_URL}/play/video?id=<video_id>   (video, fallback)
+    GET {RAILWAY_YT_API_URL}/play/audio?id=<video_id>            (audio)
+    GET {RAILWAY_YT_API_URL}/play/video/hq?id=<video_id>         (video, preferred)
+    GET {RAILWAY_YT_API_URL}/play/video?id=<video_id>            (video, fallback)
+    RAILWAY_YT_API_KEY is optional — omitted from params when not set.
     Streams bytes directly to a local file.
     Returns local file path on success, None on failure.
     """
-    if not RAILWAY_YT_API_URL or not RAILWAY_YT_API_KEY:
-        logger.error("Railway YT API not configured (RAILWAY_YT_API_URL / RAILWAY_YT_API_KEY missing)")
+    if not RAILWAY_YT_API_URL:
+        logger.error("Railway YT API not configured: RAILWAY_YT_API_URL is missing")
         return None
 
     ext        = "mp4" if media_type == "video" else "mp3"
@@ -83,9 +84,14 @@ async def _railway_download(video_id: str, media_type: str) -> str | None:
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
             for endpoint in endpoints:
+                # Build params — only include api_key when it is actually set
+                params: dict = {"id": video_id}
+                if RAILWAY_YT_API_KEY:
+                    params["api_key"] = str(RAILWAY_YT_API_KEY)
+
                 async with session.get(
                     f"{RAILWAY_YT_API_URL}/{endpoint}",
-                    params={"id": video_id, "api_key": str(RAILWAY_YT_API_KEY)},
+                    params=params,
                     timeout=aiohttp.ClientTimeout(total=timeout_dl),
                 ) as resp:
                     if resp.status == 200:
@@ -314,14 +320,17 @@ class YouTube:
             link = self.base + link
         link = _normalize_youtube_link(link)
         video_id = _extract_video_id(link) or link
-        # Use Railway API to get the stream URL for video playback
-        if not RAILWAY_YT_API_URL or not RAILWAY_YT_API_KEY:
+        if not RAILWAY_YT_API_URL:
             return 0, "Railway YT API not configured"
+        # Build params — only include api_key when it is actually set
+        params: dict = {"id": video_id}
+        if RAILWAY_YT_API_KEY:
+            params["api_key"] = str(RAILWAY_YT_API_KEY)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{RAILWAY_YT_API_URL}/play/video/hq",
-                    params={"id": video_id, "api_key": str(RAILWAY_YT_API_KEY)},
+                    params=params,
                     timeout=aiohttp.ClientTimeout(total=20),
                     allow_redirects=False,
                 ) as resp:
