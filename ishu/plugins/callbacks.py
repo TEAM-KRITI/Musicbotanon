@@ -39,6 +39,15 @@ async def _controls(_, query: types.CallbackQuery):
 
     if action == "status":
         return await query.answer()
+
+    if action == "close":
+        await query.answer()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
     await query.answer(query.lang["processing"], show_alert=True)
 
     if action == "pause":

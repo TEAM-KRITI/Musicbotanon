@@ -94,3 +94,16 @@ async def reload_admins(chat_id: int) -> list[int]:
         return [admin.user.id for admin in admins]
     except Exception:
         return []
+
+
+def cmd_delete(func):
+    @wraps(func)
+    async def wrapper(_, m: types.Message, *args, **kwargs):
+        if await db.get_cmd_delete(m.chat.id):
+            try:
+                await m.delete()
+            except Exception:
+                pass
+        return await func(_, m, *args, **kwargs)
+
+    return wrapper

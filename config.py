@@ -26,8 +26,13 @@ class Config:
         self.SUPPORT_CHAT = getenv("SUPPORT_CHAT", "https://t.me/annu_support")
 
         # Railway self-hosted YouTube API
-        self.RAILWAY_YT_API_URL = getenv("RAILWAY_YT_API_URL", "jd7hSNs6ilyVu4i~EkFx4_yONJhz.5bx")
-        self.RAILWAY_YT_API_KEY = getenv("RAILWAY_YT_API_KEY", "http://youtube-api-music-production-77fb.up.railway.app")
+        # URL must include scheme; if bare domain is given, https:// is added automatically
+        _raw_url = getenv("RAILWAY_YT_API_URL", "")
+        if _raw_url and not _raw_url.startswith(("http://", "https://")):
+            _raw_url = "https://" + _raw_url
+        self.RAILWAY_YT_API_URL = _raw_url.rstrip("/")
+        self.RAILWAY_YT_API_KEY = getenv("RAILWAY_YT_API_KEY", "")
+
 
 
         self.DEFAULT_THUMB = getenv("DEFAULT_THUMB", "https://te.legra.ph/file/3e40a408286d4eda24191.jpg")

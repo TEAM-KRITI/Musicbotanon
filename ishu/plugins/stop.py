@@ -6,12 +6,13 @@
 from pyrogram import filters, types
 
 from ishu import anon, app, db, lang
-from ishu.helpers import can_manage_vc
+from ishu.helpers import can_manage_vc, cmd_delete
 
 
 @app.on_message(filters.command(["end", "stop"]) & filters.group & ~app.bl_users)
 @lang.language()
 @can_manage_vc
+@cmd_delete
 async def _stop(_, m: types.Message):
     if len(m.command) > 1:
         return

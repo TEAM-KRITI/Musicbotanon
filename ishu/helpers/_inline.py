@@ -64,6 +64,11 @@ class Inline:
                     self.ikb(text="▢", callback_data=f"controls stop {chat_id}", style=random.choice(styles)),
                 ]
             )
+            keyboard.append(
+                [
+                    self.ikb(text="✕ Close", callback_data=f"controls close {chat_id}", style=enums.ButtonStyle.DANGER),
+                ]
+            )
         return self.ikm(keyboard)
 
     def help_markup(
