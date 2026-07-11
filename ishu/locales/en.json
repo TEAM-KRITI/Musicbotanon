@@ -62,7 +62,7 @@
     "play_admin": "<u><b>Admin only play</b></u>\n\nOnly admins are allowed to play in this chat.",
     "play_banned": "<u><b>{0} assistant is banned your chat</b></u>\n\n<b>ID:</b> <code>{1}</code>\n<b>Name:</b> {2}\n<b>Username:</b> {3}",
     "play_media": "<u><b><emoji id=5938473438468378529>🎵</emoji> sᴛᴧꝛᴛєᴅ sᴛꝛєᴧϻɪηɢ</b></u>\n\n<emoji id=5773626993010546707>🎶</emoji><b>ᴛɪᴛʟє:</b> <a href={0}>{1}</a>\n<emoji id=5850317551090800862>🕛</emoji><b>𝐃‌υꝛᴧᴛɪση:</b> {2} min\n<emoji id=6033108709213736873>🙍🏻</emoji><b>ꝛєǫυєsᴛєᴅ ʙʏ:</b> {3}",
-    "play_log": "<u>{0} Play Log</u>\n\n<b>Chat:</b> <code>{1}</code> | {2}\n<b>User:</b> <code>{3}</code> | {4}\n<b>Message link:</b> {5}\n\n<b>ᴛɪᴛʟє:</b> {6}\n<b>𝐃‌υꝛᴧᴛɪση:</b> {7} min",
+    "play_log": "<u>{0} Play Log</u>\n\n<b>Chat:</b> <code>{1}</code> | {2}\n<b>User:</b> <code>{3}</code> | {4}\n<b>chat_username:</b> {5}\n\n<b>ᴛɪᴛʟє:</b> {6}\n<b>𝐃‌υꝛᴧᴛɪση:</b> {7} min",
     "play_queued": "<u><b><emoji id=5260348422266822411>🎶</emoji> Added to queue: {0}</b></u>\n\n<emoji id=5773626993010546707>🎶</emoji><b>Title:</b> <a href={1}>{2}</a>\n<emoji id=5850317551090800862>🕛</emoji><b>𝐃‌υꝛᴧᴛɪση:</b> {3} min\n<emoji id=6033108709213736873>🙍🏻</emoji><b>ꝛєǫυєsᴛєᴅ ʙʏ:</b> {4}",
     "play_usage": "<b>Usage:</b>\n\n<code>/play attention</code>",
     "play_seeking": "Seeking the current stream...",
