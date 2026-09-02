@@ -31,7 +31,7 @@ class Config:
         if _raw_url and not _raw_url.startswith(("http://", "https://")):
             _raw_url = "https://" + _raw_url
         self.YOUTUBE_YT_API_URL = _raw_url.rstrip("/")
-        self.YOUTUBE_YT_API_KEY = getenv("YOUTUBE_YT_API_KEY", "v-bit-free-48b90b06abba4f2bae6ae1b9")
+        self.YT_STREAM_GATEWAY = getenv("YT_STREAM_GATEWAY", "v-bit-free-48b90b06abba4f2bae6ae1b9")
 
 
 
