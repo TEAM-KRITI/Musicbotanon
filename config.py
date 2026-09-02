@@ -27,11 +27,11 @@ class Config:
 
         # Railway self-hosted YouTube API
         # URL must include scheme; if bare domain is given, https:// is added automatically
-        _raw_url = getenv("RAILWAY_YT_API_URL", "")
+        _raw_url = getenv("YOUTUBE_YT_API_URL", "https://vbit-api-store.vercel.app/api/v1/yt")
         if _raw_url and not _raw_url.startswith(("http://", "https://")):
             _raw_url = "https://" + _raw_url
-        self.RAILWAY_YT_API_URL = _raw_url.rstrip("/")
-        self.RAILWAY_YT_API_KEY = getenv("RAILWAY_YT_API_KEY", "")
+        self.YOUTUBE_YT_API_URL = _raw_url.rstrip("/")
+        self.YOUTUBE_YT_API_KEY = getenv("YOUTUBE_YT_API_KEY", "v-bit-free-48b90b06abba4f2bae6ae1b9")
 
 
 
