@@ -1,1 +1,7 @@
-uv run python3 -m ishu
+if [ -f ".venv/bin/python3" ]; then
+    exec .venv/bin/python3 -m ishu
+elif [ -f ".venv/bin/python" ]; then
+    exec .venv/bin/python -m ishu
+else
+    exec python3 -m ishu
+fi
