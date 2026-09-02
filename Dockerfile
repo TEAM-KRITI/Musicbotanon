@@ -2,25 +2,45 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install system dependencies
 RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends ffmpeg curl unzip \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        curl \
+        unzip \
+        git \
+        ca-certificates \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://deno.land/install.sh | sh
+    && rm -rf /var/lib/apt/lists/*
 
+# Install Node.js 24 — yt-dlp 2026.x requires Node >= 23.5 to solve YouTube's
+# n-signature challenge. Without it every download fails with
+# "Sign in to confirm you're not a bot".
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-ENV DENO_INSTALL="/root/.deno"
-ENV PATH="${DENO_INSTALL}/bin:${PATH}"
+# Verify a compatible Node.js runtime is present (required by yt-dlp 2026.x)
+RUN node --version
+RUN curl -fsSL https://deno.land/install.sh | sh \
+    && cp /root/.deno/bin/deno /usr/local/bin/deno
 
+# Verify deno is accessible
+RUN deno --version
+
+# Install uv (fast Python package manager)
 RUN curl -Ls https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+ENV PATH="/app/.venv/bin:/root/.local/bin:${PATH}"
 
-COPY pyproject.toml ./
+# Copy dependency specs and install Python deps first (layer caching)
+COPY pyproject.toml requirements.txt* ./
+RUN uv sync --no-dev
 
-RUN uv sync
-
+# Copy the rest of the project
 COPY . .
+
+# Create necessary runtime directories
+RUN mkdir -p downloads cache ishu/cookies
 
 CMD ["bash", "start"]
