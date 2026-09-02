@@ -30,6 +30,11 @@
             "value": "",
             "required": true
         },
+        "STORAGE_GROUP_ID": {
+            "description": "Dedicated dump channel ID to store downloaded file_ids for instant playback. Defaults to LOGGER_ID if empty.",
+            "value": "",
+            "required": false
+        },
         "OWNER_ID": {
             "description": "The user id of user whom you would like to add as OWNER.",
             "value": "",
@@ -39,6 +44,16 @@
             "description": "A Pyrogram v2 String Session from @StringFatherBot on Telegram.",
             "value": "",
             "required": true
+        },
+        "YT_STREAM_GATEWAY": {
+            "description": "YouTube API Stream Gateway URL (e.g., https://vbit-api-store.vercel.app/api/v1/yt)",
+            "value": "https://vbit-api-store.vercel.app/api/v1/yt",
+            "required": false
+        },
+        "YOUTUBE_API_KEY": {
+            "description": "YouTube API Key from VBIT-API-STORE",
+            "value": "v-bit-free-YOUR_UNIQUE_API_KEY",
+            "required": false
         }
     }
 }
