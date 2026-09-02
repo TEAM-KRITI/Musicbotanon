@@ -20,8 +20,8 @@ from ishu import config, logger
 from ishu.helpers import utils
 
 # ── Config ────────────────────────────────────────────────────────────────────
-RAILWAY_YT_API_URL  = getattr(config, "RAILWAY_YT_API_URL",  None)
-RAILWAY_YT_API_KEY  = getattr(config, "RAILWAY_YT_API_KEY",  None)
+YOUTUBE_API_KEY  = getattr(config, "YOUTUBE_API_KEY",  None)
+YT_STREAM_GATEWAY  = getattr(config, "YT_STREAM_GATEWAY",  None)
 
 DOWNLOAD_DIR        = "downloads"
 
@@ -58,7 +58,7 @@ async def _railway_download(video_id: str, media_type: str) -> str | None:
     """
     Download via Railway self-hosted YouTube API.
 
-    Auth: X-API-Key header (RAILWAY_YT_API_KEY) — optional if API is open.
+    Auth: X-API-Key header (YOUTUBE_YT_API_KEY) — optional if API is open.
 
     Audio flow:
       1. GET /play/audio?id=<id>  → proxied byte stream (200 = direct file)
@@ -72,8 +72,8 @@ async def _railway_download(video_id: str, media_type: str) -> str | None:
 
     Returns local file path on success, None on failure.
     """
-    if not RAILWAY_YT_API_URL:
-        logger.error("Railway YT API not configured: RAILWAY_YT_API_URL is missing")
+    if not YOUTUBE_YT_API_URL:
+        logger.error("YouTube YT API not configured: RAILWAY_YT_API_URL is missing")
         return None
 
     ext        = "mp4" if media_type == "video" else "mp3"
@@ -89,7 +89,7 @@ async def _railway_download(video_id: str, media_type: str) -> str | None:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
     if RAILWAY_YT_API_KEY:
-        headers["X-API-Key"] = str(RAILWAY_YT_API_KEY)
+        headers["X-API-Key"] = str(YOUTUBE_YT_API_KEY)
 
     params = {"id": video_id}
 
@@ -108,15 +108,15 @@ async def _railway_download(video_id: str, media_type: str) -> str | None:
                 else:
                     logger.warning("Railway YT API %s → %s for %s", url.split("/")[-1], resp.status, video_id)
         except Exception as exc:
-            logger.warning("Railway YT API stream error for %s: %s", video_id, exc)
+            logger.warning("YOUTUBE YT API stream error for %s: %s", video_id, exc)
         return False
 
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
             if media_type == "audio":
                 # Step 1: try the proxy endpoint (direct byte stream)
-                if await _stream_to_file(session, f"{RAILWAY_YT_API_URL}/play/audio"):
-                    logger.info("Railway YT API ✓ /play/audio %s → %s", video_id, file_path)
+                if await _stream_to_file(session, f"{YOUTUBE_YT_API_URL}/play/audio"):
+                    logger.info("YOUTUBE YT API ✓ /play/audio %s → %s", video_id, file_path)
                     return file_path
 
                 # Step 2: fallback — get JSON, extract best_audio URL, then stream it
@@ -143,20 +143,20 @@ async def _railway_download(video_id: str, media_type: str) -> str | None:
                                         async for chunk in file_resp.content.iter_chunked(1024 * 1024):
                                             fobj.write(chunk)
                                     if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                                        logger.info("Railway YT API ✓ /audio+stream %s → %s", video_id, file_path)
+                                        logger.info("YouTube YT API ✓ /audio+stream %s → %s", video_id, file_path)
                                         return file_path
                     else:
-                        logger.warning("Railway YT API /audio status %s for %s", resp.status, video_id)
+                        logger.warning("YouTube YT API /audio status %s for %s", resp.status, video_id)
 
             else:  # video
                 # Step 1: try the proxy endpoint
-                if await _stream_to_file(session, f"{RAILWAY_YT_API_URL}/play/video/hq"):
-                    logger.info("Railway YT API ✓ /play/video/hq %s → %s", video_id, file_path)
+                if await _stream_to_file(session, f"{YOUTUBE_YT_API_URL}/play/video/hq"):
+                    logger.info("YouTube YT API ✓ /play/video/hq %s → %s", video_id, file_path)
                     return file_path
 
                 # Step 2: fallback — get JSON stream URL
                 async with session.get(
-                    f"{RAILWAY_YT_API_URL}/video/hq",
+                    f"{YOUTUBE_YT_API_URL}/video/hq",
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
@@ -174,15 +174,15 @@ async def _railway_download(video_id: str, media_type: str) -> str | None:
                                         async for chunk in file_resp.content.iter_chunked(1024 * 1024):
                                             fobj.write(chunk)
                                     if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                                        logger.info("Railway YT API ✓ /video/hq+stream %s → %s", video_id, file_path)
+                                        logger.info("YOUTUBE YT API ✓ /video/hq+stream %s → %s", video_id, file_path)
                                         return file_path
                     else:
-                        logger.warning("Railway YT API /video/hq status %s for %s", resp.status, video_id)
+                        logger.warning("youtube YT API /video/hq status %s for %s", resp.status, video_id)
 
         return None
 
     except Exception as exc:
-        logger.warning("Railway YT API download failed for %s: %s", video_id, exc)
+        logger.warning("youtube YT API download failed for %s: %s", video_id, exc)
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
@@ -198,7 +198,7 @@ async def _download_with_fallback(
     media_type: str,
 ) -> tuple[str | None, str]:
     """
-    Download via Railway YT API.
+    Download via YouTube YT API.
     Returns (file_path, downloader_name).
     """
     video_id = _extract_video_id(link) or link
@@ -207,7 +207,7 @@ async def _download_with_fallback(
     if result:
         return result, "railway"
 
-    logger.error("Railway YT API failed for: %s", video_id)
+    logger.error("YouTube YT API failed for: %s", video_id)
     return None, "none"
 
 
@@ -232,7 +232,7 @@ class YouTube:
         self.api      = None
         self.dl_stats = {
             "total_requests": 0,
-            "railway":        0,
+            "YouTube":        0,
             "existing_files": 0,
             "failed":         0,
         }
