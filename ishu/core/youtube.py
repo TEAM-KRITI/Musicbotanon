@@ -1,1026 +1,703 @@
-# Copyright (c) 2025 AnonymousX1025
-# Licensed under the MIT License.
-# This file is part of AnonXMusic
-#
-# Download and Streaming Method:
-#   - Railway YT API  (RAILWAY_YT_API_URL / RAILWAY_YT_API_KEY)
-#
-
-import asyncio
-import glob
 import os
-import random
 import re
-import time as _time
-from typing import Union
-
+import asyncio
 import aiohttp
+import random
+from difflib import SequenceMatcher
+from urllib.parse import quote
 import yt_dlp
-from py_yt import Playlist, VideosSearch
-from pyrogram.enums import MessageEntityType
-from pyrogram.types import Message
+from py_yt import VideosSearch, Playlist
+from ArchonMusic import logger, config
+from ArchonMusic.helpers import Track, utils
 
-from ishu import config, logger
-from ishu.helpers import utils
-from ishu.helpers._dataclass import Track
+API_URL = os.environ.get("SHRUTI_API_URL", "https://api.shrutibots.site")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-YT_STREAM_GATEWAY   = getattr(config, "YT_STREAM_GATEWAY", getattr(config, "RAILWAY_YT_API_URL", None))
-YOUTUBE_API_KEY     = getattr(config, "YOUTUBE_API_KEY", getattr(config, "RAILWAY_YT_API_KEY", None))
-# Backward compatibility aliases
-RAILWAY_YT_API_URL  = YT_STREAM_GATEWAY
-RAILWAY_YT_API_KEY  = YOUTUBE_API_KEY
+API_KEY = os.environ.get("SHRUTI_API_KEY", "") ## Get This API KEY FROM TELEGRAM BOT USERNAME: @SHRUTIAPIBOT
 
-DOWNLOAD_DIR        = "downloads"
-
-# Per-video_id locks so the foreground download() and the background prefetch
-# task never run yt-dlp on the SAME video_id concurrently. Two concurrent
-# yt-dlp processes writing the same "<id>.mp3.part" / "<id>.orig.mp3" temp
-# files cause "Unable to rename file: [Errno 2]" crashes.
-_dl_locks: "dict[str, asyncio.Lock]" = {}
-
-# Download context used to enrich the error-log message sent to the log group.
-_DL_CTX: "dict" = {}
+DOWNLOAD_DIR = "downloads"
 
 
-def set_dl_context(
-    chat_id: "int | None" = None,
-    chat_title: "str | None" = None,
-    title: "str | None" = None,
-    video: bool = False,
-) -> None:
-    """Store group/song context for the next download failure report."""
-    global _DL_CTX
-    _DL_CTX = {
-        "chat_id": chat_id,
-        "chat_title": chat_title,
-        "title": title,
-        "video": video,
-    }
-
-
-async def _notify_download_failure(video_id: str, media_type: str) -> None:
-    """Best-effort: forward a total download failure to the configured log group."""
-    from ishu.helpers import utils
-    if not getattr(config, "LOGGER_ID", 0):
-        return
-    try:
-        ctx = dict(_DL_CTX)
-        await utils.error_log(
-            context=f"Download ({'video' if media_type == 'video' else 'audio'})",
-            error=f"All download methods failed for video_id: {video_id}",
-            chat_id=ctx.get("chat_id"),
-            chat_title=ctx.get("chat_title"),
-            title=ctx.get("title") or video_id,
-            video=ctx.get("video", media_type == "video"),
-        )
-    except Exception as e:
-        logger.warning("Failed to forward download failure to log group: %s", e)
-
-
-def _dl_lock(video_id: str) -> asyncio.Lock:
-    lock = _dl_locks.get(video_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _dl_locks[video_id] = lock
-    return lock
-
-
-def _release_dl_lock(video_id: str) -> None:
-    """Clean up lock object from dictionary to prevent memory leaks."""
-    if video_id in _dl_locks and not _dl_locks[video_id].locked():
-        _dl_locks.pop(video_id, None)
-
-
-def _evict_disk_cache(max_mb: int = 3000) -> None:
-    """LRU-evict oldest files from DOWNLOAD_DIR if total size exceeds max_mb."""
-    if not os.path.exists(DOWNLOAD_DIR):
-        return
-    try:
-        max_bytes = max_mb * 1024 * 1024
-        entries = []
-        total = 0
-        for name in os.listdir(DOWNLOAD_DIR):
-            p = os.path.join(DOWNLOAD_DIR, name)
-            if not os.path.isfile(p):
-                continue
-            try:
-                st = os.stat(p)
-                entries.append((st.st_atime, st.st_size, p))
-                total += st.st_size
-            except Exception:
-                continue
-        if total <= max_bytes:
-            return
-        entries.sort(key=lambda e: e[0])
-        for _atime, size, p in entries:
-            if total <= max_bytes:
-                break
-            try:
-                os.remove(p)
-                total -= size
-                logger.info("LRU disk cache evicted: %s (%s bytes)", p, size)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning("LRU disk cache eviction error: %s", e)
-
-
-_SESSION: aiohttp.ClientSession | None = None
-
-
-def _get_http_session() -> aiohttp.ClientSession:
-    global _SESSION
-    if _SESSION is None or _SESSION.closed:
-        connector = aiohttp.TCPConnector(
-            limit=100,
-            ttl_dns_cache=300,
-            keepalive_timeout=60,
-            enable_cleanup_closed=True,
-        )
-        _SESSION = aiohttp.ClientSession(connector=connector)
-    return _SESSION
-
-
-# YT-dlp gets occasionally blocked by YouTube's bot check.
-# If COOKIES_FILE or COOKIES_DATA is configured, decode/derive a cookie text
-# file that yt-dlp can load via STANDARD cookie file auth header auth semantics.
-_COOKIE_PATH: str | None = None
-
-
-def cookie_txt_file() -> str | None:
-    """Return the best available Netscape-format cookie file path for yt-dlp."""
-    global _COOKIE_PATH
-    if _COOKIE_PATH is not None:
-        return _COOKIE_PATH
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    folder = os.path.abspath(os.path.join(base_dir, "..", "cookies"))
-    primary = os.path.join(folder, "cookie_0.txt")
-    if os.path.exists(primary):
-        _COOKIE_PATH = primary
-        return primary
-    try:
-        txt_files = glob.glob(os.path.join(folder, "*.txt"))
-    except Exception:
-        txt_files = []
-    _COOKIE_PATH = txt_files[0] if txt_files else None
-    return _COOKIE_PATH
-
-
-def _resolve_downloaded_file(video_id: str, ext: str) -> str | None:
-    """
-    Find the actual file produced by yt-dlp for `video_id`.
-    """
-    import glob as _glob
-
-    candidates = [
-        os.path.join(DOWNLOAD_DIR, f"{video_id}.{ext}"),
-        os.path.join(DOWNLOAD_DIR, f"{video_id}.{ext}.{ext}"),
-    ]
-    for c in sorted(_glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}.*"))):
-        if c.endswith((".part", ".ytdl")) or ".orig." in os.path.basename(c):
-            continue
-        candidates.append(c)
-
-    for c in candidates:
-        if os.path.exists(c) and os.path.getsize(c) > 0:
-            return c
-    return None
-
-
-# yt-dlp 2026.x needs a JS runtime to solve YouTube's n-signature challenge.
-# The default runtime is 'deno', but it is unreliable in containers; Node >= 23.5
-# is the dependable choice. If no working runtime is available every request
-# fails with "Sign in to confirm you're not a bot". Force the 'node' runtime.
-JS_RUNTIMES = {"node": {}}
-
-# YouTube's "Sign in to confirm you're not a bot" check is applied per player
-# client. The default 'web' client is the most aggressively gated; the mobile
-# and TV clients ('tv', 'ios', 'android', 'mweb', 'web_safari') frequently
-# bypass it entirely — no cookies or proxy needed. yt-dlp tries these in order
-# and uses the first that returns a playable response. Override with the
-# YT_PLAYER_CLIENTS env var (comma-separated) if YouTube shifts its gating.
-_DEFAULT_PLAYER_CLIENTS = "tv,ios,android,web_safari,mweb,web"
-
-
-def _with_js_runtime(opts: dict) -> dict:
-    """Return a copy of yt-dlp opts with the node runtime, player-client
-    bypass, and optional proxy.
-
-    - Player clients (tv/ios/android/...) dodge the web bot-check with no
-      external dependency. Tune with the YT_PLAYER_CLIENTS env var.
-    - Set the YTDLP_PROXY env var (e.g. http://user:pass@host:port or
-      socks5://host:port) to route every yt-dlp request through a clean IP —
-      the reliable fix when the whole server IP is bot-flagged.
-    """
-    out = dict(opts)
-    out["js_runtimes"] = JS_RUNTIMES
-
-    clients = [
-        c.strip()
-        for c in os.environ.get("YT_PLAYER_CLIENTS", _DEFAULT_PLAYER_CLIENTS).split(",")
-        if c.strip()
-    ]
-    if clients:
-        extractor_args = dict(out.get("extractor_args") or {})
-        yt_args = dict(extractor_args.get("youtube") or {})
-        yt_args["player_client"] = clients
-        extractor_args["youtube"] = yt_args
-        out["extractor_args"] = extractor_args
-
-    proxy = os.environ.get("YTDLP_PROXY") or os.environ.get("HTTPS_PROXY")
-    if proxy:
-        out["proxy"] = proxy
-    return out
-
-
-
-# ── Link helpers ──────────────────────────────────────────────────────────────
-def _normalize_youtube_link(
-    link: str,
-    base: str = "https://www.youtube.com/watch?v=",
-) -> str:
-    if not link:
-        return ""
-    cleaned = link.strip()
-    if "youtube.com" not in cleaned and "youtu.be" not in cleaned:
-        cleaned = base + cleaned
-    cleaned = cleaned.split("&si=")[0].split("?si=")[0]
-    if "&" in cleaned and "list=" not in cleaned:
-        cleaned = cleaned.split("&")[0]
-    return cleaned
-
-
-def _extract_video_id(link: str) -> str | None:
-    cleaned = _normalize_youtube_link(link)
-    if not cleaned:
+async def download_song(link: str) -> str:
+    video_id = link.split("v=")[-1].split("&")[0] if "v=" in link else link
+    if not video_id or len(video_id) < 3:
         return None
-    if "v=" in cleaned:
-        return cleaned.split("v=")[-1].split("&")[0]
-    if "youtu.be/" in cleaned:
-        return cleaned.split("youtu.be/")[-1].split("?")[0].split("&")[0]
-    return cleaned if len(cleaned) == 11 else None
-
-
-# ── Downloader: YouTube Stream Gateway / API + Direct yt-dlp Fallback ───────
-async def _railway_download(video_id: str, media_type: str) -> str | None:
-    """
-    Download via YouTube Stream Gateway / API proxy (vbit-api-store, Railway, Heroku).
-    Streams the media directly from the gateway endpoint to a local file.
-    Returns local file path on success, None on failure.
-    """
-    gateway_url = (YT_STREAM_GATEWAY or RAILWAY_YT_API_URL or "").rstrip("/")
-    api_key = YOUTUBE_API_KEY or RAILWAY_YT_API_KEY
-    if not gateway_url or not api_key:
-        return None
-
-    ext        = "mp4" if media_type == "video" else "mp3"
-    timeout_dl = 600   if media_type == "video" else 300
-    file_path  = os.path.join(DOWNLOAD_DIR, f"{video_id}.{ext}")
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
     if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-        try:
-            os.utime(file_path, None)
-        except Exception:
-            pass
         return file_path
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "X-API-Key": str(api_key),
-    }
-    endpoints = ["play/video/hq", "play/video"] if media_type == "video" else ["play/audio"]
-
     try:
-        session = _get_http_session()
-        for endpoint in endpoints:
-            media_url = f"{gateway_url}/{endpoint}?id={video_id}&api_key={api_key}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{API_URL}/download",
+                params={"url": video_id, "type": "audio", "api_key": API_KEY},
+                timeout=aiohttp.ClientTimeout(total=300)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                with open(file_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(131072):
+                        f.write(chunk)
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            return file_path
+        return None
+    except Exception:
+        if os.path.exists(file_path):
             try:
-                async with session.get(
-                    media_url,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout_dl),
-                    allow_redirects=True,
-                ) as file_resp:
-                    if file_resp.status != 200:
-                        logger.warning(
-                            "YouTube API stream failed: status %s for %s",
-                            file_resp.status, endpoint,
-                        )
-                        continue
-
-                    with open(file_path, "wb") as fobj:
-                        async for chunk in file_resp.content.iter_chunked(512 * 1024):
-                            fobj.write(chunk)
-
-                    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                        _evict_disk_cache()
-                        logger.info("YouTube Gateway API ✓ %s → %s", video_id, file_path)
-                        return file_path
-            except Exception as ep_err:
-                logger.warning("YouTube Gateway API endpoint %s failed for %s: %s", endpoint, video_id, ep_err)
-
-        return None
-
-    except Exception as exc:
-        logger.warning("YouTube Gateway API download failed for %s: %s", video_id, exc)
-        try:
-            if os.path.exists(file_path):
                 os.remove(file_path)
-        except OSError:
-            pass
+            except Exception:
+                pass
         return None
 
 
-async def _direct_ytdlp_download(video_id: str, media_type: str) -> str | None:
-    """Fast direct yt-dlp fallback with multi-threaded fragment downloads (-N 4)."""
-    ext = "mp4" if media_type == "video" else "mp3"
-    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.{ext}")
+async def download_video(link: str) -> str:
+    video_id = link.split("v=")[-1].split("&")[0] if "v=" in link else link
+    if not video_id or len(video_id) < 3:
+        return None
+
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    link = f"https://www.youtube.com/watch?v={video_id}"
-
-    cmd = [
-        "yt-dlp",
-        "--js-runtimes", "node",
-        "-N", "4",
-        "--buffer-size", "16k",
-        "--no-playlist",
-        "--no-warnings",
-        "-q",
-    ]
-    # YouTube bot-checks the default `web` client hardest; the mobile/TV clients
-    # (tv, ios, android, web_safari, mweb) routinely bypass the "Sign in to
-    # confirm you're not a bot" check with no cookies or proxy needed. Tune the
-    # list via the YT_PLAYER_CLIENTS env var (comma-separated).
-    _clients = [
-        c.strip()
-        for c in os.environ.get("YT_PLAYER_CLIENTS", _DEFAULT_PLAYER_CLIENTS).split(",")
-        if c.strip()
-    ]
-    if _clients:
-        cmd += ["--extractor-args", f"youtube:player_client={','.join(_clients)}"]
-    cookie = cookie_txt_file()
-    if cookie:
-        cmd.extend(["--cookies", cookie])
-
-    if media_type == "video":
-        cmd.extend(["-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best", "--merge-output-format", "mp4"])
-    else:
-        cmd.extend(["-x", "--audio-format", "mp3", "--audio-quality", "0"])
-
-    cmd.extend(["-o", file_path, link])
+    file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        return file_path
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        resolved = _resolve_downloaded_file(video_id, ext)
-        if resolved:
-            _evict_disk_cache()
-            return resolved
-        logger.warning("Direct yt-dlp download returned no file for %s: %s", video_id, stderr.decode())
-    except Exception as e:
-        logger.warning("Direct yt-dlp download failed for %s: %s", video_id, e)
-    return None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{API_URL}/download",
+                params={"url": video_id, "type": "video", "api_key": API_KEY},
+                timeout=aiohttp.ClientTimeout(total=600)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                with open(file_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(131072):
+                        f.write(chunk)
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            return file_path
+        return None
+    except Exception:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+        return None
 
 
-# ── Main download entrypoint ──────────────────────────────────────────────────
-async def _download_with_fallback(
-    link: str,
-    media_type: str,
-) -> tuple[str | None, str]:
-    """
-    Download using Railway YT API (with retries) -> Fallback to direct fast yt-dlp.
-    Returns (file_path, downloader_name)
-    """
-    video_id = _extract_video_id(link) or link
-
-    # YouTube Stream Gateway is the primary, reliable path. yt-dlp almost always fails
-    # on host/cloud IPs ("Sign in to confirm you're not a bot"), so retry Gateway
-    # up to 5 times with exponential backoff (2s, 4s, 8s, 16s) before giving up.
-    max_gateway_attempts = 5
-    for attempt in range(1, max_gateway_attempts + 1):
-        result = await _railway_download(video_id, media_type)
-        if result:
-            return result, "gateway"
-        if attempt < max_gateway_attempts:
-            wait = min(2 ** attempt, 30)
-            logger.info(
-                "YouTube Gateway API attempt %s/%s failed for %s. Retrying in %ss...",
-                attempt, max_gateway_attempts, video_id, wait,
-            )
-            await asyncio.sleep(wait)
-
-    logger.warning(
-        "YouTube Gateway API failed after %s attempts for %s. Trying yt-dlp fallback.",
-        max_gateway_attempts, video_id,
-    )
-    result = await _direct_ytdlp_download(video_id, media_type)
-    if result:
-        return result, "yt-dlp"
-
-    logger.error("Download failed for: %s", video_id)
-    await _notify_download_failure(video_id, media_type)
-    return None, "none"
-
-
-
-# ── Public helpers (kept for backward compat with play.py / calls.py) ─────────
-async def download_song(link: str, title: str | None = None) -> str | None:
-    path, _ = await _download_with_fallback(link, "audio")
-    return path
-
-
-async def download_video(link: str, title: str | None = None) -> str | None:
-    path, _ = await _download_with_fallback(link, "video")
-    return path
-
-
-# ── YouTube class ─────────────────────────────────────────────────────────────
 class YouTube:
     def __init__(self):
-        self.base     = "https://www.youtube.com/watch?v="
-        self.regex    = r"(?:youtube\.com|youtu\.be)"
-        self.listbase = "https://youtube.com/playlist?list="
-        self.reg      = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-        self.api      = None
+        self.base = "https://www.youtube.com/watch?v="
+        # Keep the original user search outside Track so the Track dataclass
+        # stays backwards-compatible. This lets autoplay preserve language
+        # context across the autoplay chain.
+        self.track_context: dict[str, str] = {}
+        self.regex = re.compile(
+            r"(https?://)?(www\.|m\.|music\.)?"
+            r"(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
+            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
+        )
+        self.cookie_dir = "AloneX/cookies"
 
-        self.dl_stats = {
-            "total_requests": 0,
-            "gateway":        0,
-            "railway":        0,
-            "failed":         0,
-        }
+    def get_cookies(self):
+        if not os.path.exists(self.cookie_dir):
+            return None
+        cookies_files = [f for f in os.listdir(self.cookie_dir) if f.endswith(".txt")]
+        if not cookies_files:
+            return None
+        return os.path.join(self.cookie_dir, random.choice(cookies_files))
 
-    # ── Validators ────────────────────────────────────────────────────────────
+    async def save_cookies(self, urls: list[str]) -> None:
+        logger.info("Saving cookies from urls...")
+        if not os.path.exists(self.cookie_dir):
+            os.makedirs(self.cookie_dir)
+        async with aiohttp.ClientSession() as session:
+            for i, url in enumerate(urls):
+                path = f"{self.cookie_dir}/cookie_{i}.txt"
+                link = "https://batbin.me/api/v2/paste/" + url.split("/")[-1]
+                async with session.get(link) as resp:
+                    resp.raise_for_status()
+                    with open(path, "wb") as fw:
+                        fw.write(await resp.read())
+        logger.info(f"Cookies saved in {self.cookie_dir}.")
+
     def valid(self, url: str) -> bool:
-        return bool(re.search(self.regex, url))
+        if not url:
+            return False
+        return bool(re.match(self.regex, url))
 
     def invalid(self, url: str) -> bool:
+        """Compatibility helper used by the /play URL validator."""
         return not self.valid(url)
 
-    # ── URL utilities ─────────────────────────────────────────────────────────
-    async def exists(self, link: str, videoid: Union[bool, str] = None) -> bool:
-        if videoid:
-            link = self.base + link
-        return bool(re.search(self.regex, link))
-
-    async def url(self, message_1: Message) -> Union[str, None]:
-        messages = [message_1]
-        if message_1.reply_to_message:
-            messages.append(message_1.reply_to_message)
-        for message in messages:
-            text = message.text or message.caption or ""
-            if message.entities:
-                for entity in message.entities:
-                    if entity.type == MessageEntityType.URL:
-                        return text[entity.offset: entity.offset + entity.length]
-                    if entity.type == MessageEntityType.TEXT_LINK:
-                        return entity.url
-            if message.caption_entities:
-                for entity in message.caption_entities:
-                    if entity.type == MessageEntityType.TEXT_LINK:
-                        return entity.url
+    async def search(self, query: str, m_id: int, video: bool = False) -> Track | None:
+        try:
+            _search = VideosSearch(query, limit=1)
+            results = await _search.next()
+            if results and results["result"]:
+                data = results["result"][0]
+                track = Track(
+                    id=data.get("id"),
+                    channel_name=data.get("channel", {}).get("name"),
+                    duration=data.get("duration"),
+                    duration_sec=utils.to_seconds(data.get("duration")) if data.get("duration") else 0,
+                    message_id=m_id,
+                    title=(data.get("title") or "")[:80],
+                    thumbnail=data.get("thumbnails", [{}])[-1].get("url").split("?")[0],
+                    url=data.get("link"),
+                    view_count=data.get("viewCount", {}).get("short"),
+                    video=video,
+                )
+                if track.id and query:
+                    self.track_context[str(track.id)] = str(query).strip()
+                return track
+        except Exception as e:
+            logger.error(f"Search error: {e}")
         return None
 
-    # ── Metadata fetchers ─────────────────────────────────────────────────────
-    async def details(self, link: str, videoid: Union[bool, str] = None):
-        if videoid:
-            link = self.base + link
-        link = _normalize_youtube_link(link)
-        results = VideosSearch(link, limit=1)
-        r = (await results.next())["result"][0]
-        title        = r["title"]
-        duration_min = r["duration"]
-        thumbnail    = r["thumbnails"][0]["url"].split("?")[0]
-        vidid        = r["id"]
-        duration_sec = int(utils.to_seconds(duration_min)) if duration_min else 0
-        return title, duration_min, duration_sec, thumbnail, vidid
+    async def stream_url(self, video_id: str, video: bool = False) -> str | None:
+        """Resolve a direct media URL for immediate playback.
 
-    async def title(self, link: str, videoid: Union[bool, str] = None) -> str | None:
-        if videoid:
-            link = self.base + link
-        link = _normalize_youtube_link(link)
-        results = VideosSearch(link, limit=1)
-        for r in (await results.next())["result"]:
-            return r["title"]
-        return None
+        Try a few YouTube player clients because one client can fail while
+        another still exposes a playable direct URL. No full download is
+        performed here; ffmpeg/pytgcalls streams the returned URL directly.
+        """
+        if not video_id:
+            return None
 
-    async def duration(self, link: str, videoid: Union[bool, str] = None) -> str | None:
-        if videoid:
-            link = self.base + link
-        link = _normalize_youtube_link(link)
-        results = VideosSearch(link, limit=1)
-        for r in (await results.next())["result"]:
-            return r["duration"]
-        return None
+        raw_id = str(video_id)
+        # The external download API already handles YouTube extraction on a
+        # server-side IP. Returning its media endpoint first avoids the
+        # YouTube anti-bot challenge seen on Heroku/cloud IPs and lets
+        # ffmpeg/pytgcalls start playback without downloading the whole file.
+        if not video:
+            api_stream = (
+                f"{API_URL}/download?url={quote(raw_id, safe='')}"
+                f"&type=audio&api_key={quote(API_KEY, safe='')}"
+            )
+            return api_stream
 
-    async def thumbnail(self, link: str, videoid: Union[bool, str] = None) -> str | None:
-        if videoid:
-            link = self.base + link
-        link = _normalize_youtube_link(link)
-        results = VideosSearch(link, limit=1)
-        for r in (await results.next())["result"]:
-            return r["thumbnails"][0]["url"].split("?")[0]
-        return None
+        url = raw_id if raw_id.startswith("http") else f"{self.base}{raw_id}"
+        cookie = self.get_cookies()
 
-    async def track(self, link: str, videoid: Union[bool, str] = None):
-        if videoid:
-            link = self.base + link
-        link = _normalize_youtube_link(link)
-        results = VideosSearch(link, limit=1)
-        for r in (await results.next())["result"]:
-            track_details = {
-                "title":        r["title"],
-                "link":         r["link"],
-                "vidid":        r["id"],
-                "duration_min": r["duration"],
-                "thumb":        r["thumbnails"][0]["url"].split("?")[0],
+        clients = ["web", "android", "tv", "web_safari"]
+        for client in clients:
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "noplaylist": True,
+                "geo_bypass": True,
+                "socket_timeout": 8,
+                "retries": 1,
+                "extractor_retries": 1,
+                "format": (
+                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+                    if video else
+                    "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+                ),
+                "extractor_args": {
+                    "youtube": {"player_client": [client]},
+                },
             }
-            return track_details, r["id"]
-        return None, None
+            if cookie:
+                opts["cookiefile"] = cookie
 
-    async def search(
-        self,
-        query: str,
-        message_id: int,
-        video: bool = False,
-    ):
-        """Search YouTube and return a Track dataclass or None.
-        Prioritizes official studio versions, avoids remixes/covers/live etc.
-        """
-        from ishu.helpers._dataclass import Track
-
-        avoid_keywords = [
-            "remix", "cover", "live", "slowed", "reverb", "extended", "acoustic",
-            "instrumental", "karaoke", "8d", "bass boosted", "nightcore", "edit"
-        ]
-
-        query_lower = query.strip().lower()
-        explicit_avoid = any(kw in query_lower for kw in avoid_keywords)
-
-        try:
-            search_queries = [
-                f"{query.strip()} official audio",
-                f"{query.strip()} official video",
-                query.strip()
-            ] if not explicit_avoid else [query.strip()]
-
-            for sq in search_queries:
-                results = VideosSearch(sq, limit=10)
-                raw_results = (await results.next())["result"]
-                if not raw_results:
-                    continue
-
-                filtered = []
-                for r in raw_results:
-                    title_lower = r.get("title", "").lower()
-
-                    if not explicit_avoid:
-                        if any(kw in title_lower for kw in avoid_keywords):
-                            continue
-
-                    duration_str = r.get("duration") or "0:00"
-                    parts = duration_str.split(":")
-                    try:
-                        if len(parts) == 3:
-                            secs = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-                        elif len(parts) == 2:
-                            secs = int(parts[0]) * 60 + int(parts[1])
-                        else:
-                            secs = 0
-                    except (ValueError, IndexError):
-                        secs = 0
-
-                    if 30 <= secs <= 3600:
-                        filtered.append(r)
-
-                if filtered:
-                    r = filtered[0]
-                    vidid = r["id"]
-                    duration_min = r.get("duration") or "00:00"
-                    duration_sec = int(utils.to_seconds(duration_min)) if duration_min else 0
-                    view_count = None
-                    if "viewCount" in r and isinstance(r["viewCount"], dict):
-                        view_count = r["viewCount"].get("short") or r["viewCount"].get("text")
-                    return Track(
-                        id           = vidid,
-                        title        = r["title"],
-                        url          = r.get("link", self.base + vidid),
-                        duration     = duration_min,
-                        duration_sec = duration_sec,
-                        thumbnail    = r["thumbnails"][0]["url"].split("?")[0],
-                        channel_name = (r.get("channel") or {}).get("name", ""),
-                        message_id   = message_id,
-                        video        = video,
-                        time         = int(_time.time()),
-                        view_count   = view_count,
+            def extract():
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if not info:
+                        return None
+                    direct = info.get("url")
+                    if direct:
+                        return direct
+                    formats = info.get("formats") or []
+                    if video:
+                        candidates = [
+                            f for f in formats
+                            if f.get("url") and f.get("vcodec") not in (None, "none")
+                        ]
+                    else:
+                        candidates = [
+                            f for f in formats
+                            if f.get("url") and f.get("acodec") not in (None, "none")
+                        ]
+                    candidates.sort(
+                        key=lambda f: (
+                            float(f.get("abr") or 0),
+                            float(f.get("tbr") or 0),
+                            int(f.get("height") or 0),
+                        ),
+                        reverse=True,
                     )
+                    return candidates[0].get("url") if candidates else None
 
-            return None
-        except Exception as e:
-            logger.warning("YouTube search error for '%s': %s", query, e)
-            return None
-
-    # ── Slider ────────────────────────────────────────────────────────────────
-    async def slider(self, link: str, query_type: int, videoid: Union[bool, str] = None):
-        if videoid:
-            link = self.base + link
-        link        = _normalize_youtube_link(link)
-        search      = VideosSearch(link, limit=10)
-        raw_results = (await search.next()).get("result", [])
-
-        filtered = []
-        for item in raw_results:
-            duration_str = item.get("duration") or "0:00"
-            parts = duration_str.split(":")
             try:
-                if len(parts) == 3:
-                    secs = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-                elif len(parts) == 2:
-                    secs = int(parts[0]) * 60 + int(parts[1])
-                else:
-                    secs = 0
-            except (ValueError, IndexError):
-                continue
-            if 0 < secs <= 3600:
-                filtered.append(item)
-
-        if not filtered or query_type >= len(filtered):
-            raise ValueError("No suitable videos found within duration limit")
-
-        s = filtered[query_type]
-        return s["title"], s.get("duration") or "0:00", s["thumbnails"][0]["url"].split("?")[0], s["id"]
-
-    # ── Formats (yt-dlp) ──────────────────────────────────────────────────────
-    async def formats(self, link: str, videoid: Union[bool, str] = None):
-        if videoid:
-            link = self.base + link
-        link = _normalize_youtube_link(link)
-        ydl = yt_dlp.YoutubeDL(_with_js_runtime({"quiet": True}))
-        with ydl:
-            info = ydl.extract_info(link, download=False)
-        formats_available = []
-        for fmt in info.get("formats", []):
-            try:
-                if "dash" not in str(fmt["format"]).lower():
-                    formats_available.append({
-                        "format":      fmt["format"],
-                        "filesize":    fmt.get("filesize"),
-                        "format_id":   fmt["format_id"],
-                        "ext":         fmt["ext"],
-                        "format_note": fmt.get("format_note"),
-                        "yturl":       link,
-                    })
-            except Exception:
-                continue
-        return formats_available, link
-
-    # ── Video stream URL (yt-dlp, no download) ────────────────────────────────
-    async def video(self, link: str, videoid: Union[bool, str] = None):
-        if videoid:
-            link = self.base + link
-        link = _normalize_youtube_link(link)
-        proc = await asyncio.create_subprocess_exec(
-            "yt-dlp", "--js-runtimes", "node", "-g",
-            "-f", "best[height<=?720][width<=?1280]", link,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return 0, "yt-dlp video extract timed out"
-        if stdout:
-            return 1, stdout.decode().split("\n")[0]
-        return 0, stderr.decode()
-
-    async def get_related(self, video_id: str, message_id: int) -> "Track | None":
-        """Return a RELATED Track for autoplay (NOT the same song).
-
-        Uses yt-dlp to pull YouTube's up-next 'related_videos' of the current
-        track and returns the first usable one as a Track. This guarantees a
-        *different* track (YouTube's own recommendations) instead of
-        re-searching the current title (which just returns the same song).
-
-        FIX (autoplay was broken): the old call used ``extract_flat=True``,
-        which SKIPS the watch_next browse request that populates
-        ``related_videos`` — so it always returned ``None`` and forced the
-        caller into its title-search fallback (same song). A normal (non-flat)
-        extract is used here so the related list is actually filled.
-        """
-        link = self.base + video_id
-        loop = asyncio.get_event_loop()
-        def _run():
-            try:
-                # NOTE: extract_flat=True omits the watch_next browse request,
-                # so YouTube never returns 'related_videos'. Use a normal
-                # extract (player-client bypass from _with_js_runtime helps
-                # dodge the bot-check) so the up-next list is populated.
-                opts = {
-                    "quiet": True,
-                    "no_warnings": True,
-                }
-                cookie = cookie_txt_file()
-                if cookie:
-                    opts["cookiefile"] = cookie
-                with yt_dlp.YoutubeDL(_with_js_runtime(opts)) as ydl:
-                    info = ydl.extract_info(link, download=False) or {}
-                rel = info.get("related_videos") or []
-                # Skip the finished video itself and any playlist/mix/channel
-                # entries (no usable single-video id / duration).
-                for r in rel:
-                    rid = r.get("id")
-                    if not rid or rid == video_id:
-                        continue
-                    if "list=" in (r.get("url") or ""):
-                        continue
-                    if r.get("duration") is None and not r.get("title"):
-                        continue
-                    return r
-                return None
-            except Exception as e:
-                logger.warning("get_related failed for %s: %s", video_id, e)
-                return None
-        try:
-            r = await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=20)
-        except asyncio.TimeoutError:
-            logger.warning("get_related timed out for %s", video_id)
-            return None
-        if not r:
-            return None
-        rid = r.get("id")
-        if not rid:
-            return None
-        duration_min = r.get("duration") or "00:00"
-        try:
-            duration_sec = int(utils.to_seconds(duration_min)) if duration_min else 0
-        except Exception:
-            duration_sec = 0
-        return Track(
-            id=rid,
-            title=r.get("title", "Unknown"),
-            url=r.get("url", self.base + rid),
-            duration=duration_min,
-            duration_sec=duration_sec,
-            thumbnail=(r.get("thumbnails") or [{}])[0].get("url", "").split("?")[0],
-            channel_name=r.get("channel") or r.get("uploader") or "",
-            message_id=message_id,
-            video=False,
-            time=int(_time.time()),
-        )
-
-    async def get_related_candidates(self, video_id: str, limit: int = 15) -> list[Track]:
-        """Return a list of RELATED Tracks for autoplay candidate pool."""
-        link = self.base + video_id
-        loop = asyncio.get_event_loop()
-
-        def _run():
-            try:
-                opts = {
-                    "quiet": True,
-                    "no_warnings": True,
-                }
-                cookie = cookie_txt_file()
-                if cookie:
-                    opts["cookiefile"] = cookie
-                with yt_dlp.YoutubeDL(_with_js_runtime(opts)) as ydl:
-                    info = ydl.extract_info(link, download=False) or {}
-                rel = info.get("related_videos") or []
-                candidates = []
-                for r in rel:
-                    rid = r.get("id")
-                    if not rid or rid == video_id:
-                        continue
-                    if "list=" in (r.get("url") or ""):
-                        continue
-                    if r.get("duration") is None and not r.get("title"):
-                        continue
-                    candidates.append(r)
-                    if len(candidates) >= limit:
-                        break
-                return candidates
-            except Exception as e:
-                logger.warning("get_related_candidates failed for %s: %s", video_id, e)
-                return []
-
-        try:
-            raw_list = await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=20)
-        except asyncio.TimeoutError:
-            logger.warning("get_related_candidates timed out for %s", video_id)
-            raw_list = []
-
-        tracks = []
-        for r in raw_list:
-            rid = r.get("id")
-            if not rid:
-                continue
-            dur_val = r.get("duration")
-            if isinstance(dur_val, (int, float)):
-                m, s = divmod(int(dur_val), 60)
-                h, m = divmod(m, 60)
-                duration_min = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-                duration_sec = int(dur_val)
-            else:
-                duration_min = str(dur_val or "00:00")
-                try:
-                    duration_sec = int(utils.to_seconds(duration_min)) if duration_min else 0
-                except Exception:
-                    duration_sec = 0
-
-            tracks.append(
-                Track(
-                    id=rid,
-                    title=r.get("title", "Unknown Track"),
-                    url=r.get("url", self.base + rid),
-                    duration=duration_min,
-                    duration_sec=duration_sec,
-                    thumbnail=(r.get("thumbnails") or [{}])[0].get("url", "").split("?")[0],
-                    channel_name=r.get("channel") or r.get("uploader") or "",
-                    message_id=0,
-                    video=False,
-                    time=int(_time.time()),
+                direct = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(None, extract),
+                    timeout=12,
                 )
-            )
+                if direct:
+                    logger.info(f"[YouTube] Direct stream ready via {client}: {video_id}")
+                    return direct
+            except Exception as e:
+                logger.warning(f"[YouTube] stream client {client} failed for {video_id}: {e}")
+
+        return None
+
+    async def autoplay_track(
+        self,
+        video_id: str,
+        video: bool = False,
+        exclude=None,
+        exclude_titles=None,
+        title: str | None = None,
+        channel_name: str | None = None,
+    ) -> Track | None:
+        """Return a related track for autoplay.
+
+        The title/channel are passed from the currently playing Track so the
+        search fallback can still work when YouTube's RD mix endpoint is
+        blocked on Heroku/cloud IPs.
+        """
+        if not video_id:
+            return None
+        current = Track(
+            id=video_id,
+            video=video,
+            title=title or "",
+            channel_name=channel_name or "",
+        )
+        # The original /play query is stored outside Track, keyed by video ID.
+        # This keeps the Track dataclass backward-compatible.
+        context_query = self.track_context.get(str(video_id), "").strip()
+        return await self.get_related(
+            current,
+            played=list(exclude or []),
+            played_titles=set(exclude_titles or []),
+            context_query=context_query or None,
+        )
+
+    async def playlist(self, limit: int, user: str, url: str, video: bool) -> list[Track]:
+        tracks = []
+        try:
+            plist = await Playlist.get(url)
+            for data in plist.get("videos", [])[:limit]:
+                track = Track(
+                    id=data.get("id"),
+                    channel_name=data.get("channel", {}).get("name", ""),
+                    duration=data.get("duration"),
+                    duration_sec=utils.to_seconds(data.get("duration")) if data.get("duration") else 0,
+                    title=(data.get("title") or "")[:80],
+                    thumbnail=data.get("thumbnails", [{}])[-1].get("url").split("?")[0],
+                    url=data.get("link").split("&list=")[0],
+                    user=user,
+                    view_count="",
+                    video=video,
+                )
+                tracks.append(track)
+        except Exception as e:
+            logger.error(f"Playlist error: {e}")
         return tracks
 
-    async def search_similar_candidates(self, query: str, limit: int = 10) -> list[Track]:
-        """Search YouTube for similar candidate tracks for autoplay fallback."""
-        try:
-            results = VideosSearch(query, limit=limit)
-            raw_results = (await results.next()).get("result", [])
-            tracks = []
-            for r in raw_results:
-                vidid = r.get("id")
-                if not vidid:
-                    continue
-                duration_min = r.get("duration") or "00:00"
-                try:
-                    duration_sec = int(utils.to_seconds(duration_min)) if duration_min else 0
-                except Exception:
-                    duration_sec = 0
+    async def download(self, video_id: str, video: bool = False) -> str | None:
+        if not video_id or len(video_id) < 3:
+            return None
 
-                tracks.append(
+        if video:
+            return await download_video(video_id)
+        else:
+            return await download_song(video_id)
+
+    def _format_duration(self, seconds: int) -> str:
+        seconds = max(int(seconds or 0), 0)
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
+
+    def _format_views(self, count) -> str:
+        if not count:
+            return ""
+        count = int(count)
+        if count >= 1_000_000:
+            return f"{count / 1_000_000:.1f}M views"
+        if count >= 1_000:
+            return f"{count / 1_000:.1f}K views"
+        return f"{count} views"
+
+    def _extract_related(self, video_id: str) -> dict | None:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+            "ignoreerrors": True,
+            "geo_bypass": True,
+            "socket_timeout": 10,
+            "retries": 1,
+            "extractor_retries": 1,
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
+        }
+        cookie = self.get_cookies()
+        if cookie:
+            opts["cookiefile"] = cookie
+
+        url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    async def _related_from_mix(
+        self, video_id: str, played: set[str], played_titles: set[str],
+        language_hint: str | None = None,
+    ) -> Track | None:
+        loop = asyncio.get_event_loop()
+        try:
+            info = await asyncio.wait_for(
+                loop.run_in_executor(None, self._extract_related, video_id),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[Autoplay] Mix fetch timed out for {video_id}.")
+            return None
+        except Exception as e:
+            logger.error(f"[Autoplay] Mix fetch failed for {video_id}: {e}")
+            return None
+
+        entries = (info or {}).get("entries") or []
+        for entry in entries:
+            if not entry:
+                continue
+
+            eid = entry.get("id")
+            if not eid or eid in played:
+                continue
+
+            title = entry.get("title") or "Unknown"
+            if title.lower() in ("[deleted video]", "[private video]"):
+                continue
+
+            normalized_title = re.sub(r"\W+", " ", title.lower()).strip()
+            if normalized_title in played_titles:
+                continue
+
+            # Keep the RD mix in the same regional language when possible.
+            if language_hint:
+                detected = self._detect_language_hint(
+                    title=title,
+                    channel=entry.get("channel") or entry.get("uploader") or "",
+                )
+                if detected and detected.lower() != language_hint.lower():
+                    continue
+
+            duration = int(entry.get("duration") or 0)
+            if duration <= 0 or duration > config.DURATION_LIMIT:
+                continue
+
+            thumbs = entry.get("thumbnails") or []
+            thumbnail = thumbs[-1]["url"].split("?")[0] if thumbs else None
+
+            return Track(
+                id=eid,
+                channel_name=entry.get("channel") or entry.get("uploader") or "YouTube",
+                duration=self._format_duration(duration),
+                duration_sec=duration,
+                title=title[:80],
+                thumbnail=thumbnail,
+                url=f"https://www.youtube.com/watch?v={eid}",
+                view_count=self._format_views(entry.get("view_count")),
+                video=False,
+            )
+
+        return None
+
+    @staticmethod
+    def _norm_title(value: str) -> str:
+        """Normalize a YouTube title for duplicate-song detection."""
+        value = str(value or "").lower()
+        # Remove common upload labels which make the same song look different.
+        value = re.sub(
+            r"\b(official\s*(music\s*)?video|official\s*audio|lyrics?|lyric\s*video|full\s*(song|video)|hd|4k|8k|audio|video|remaster(?:ed)?|reupload|original\s*song|dj\s*mix|extended|slowed(?:\s*\+\s*reverb)?|speed\s*up|sped\s*up)\b",
+            " ",
+            value,
+        )
+        value = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", value)
+        return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+    @classmethod
+    def _same_song(cls, a: str, b: str) -> bool:
+        """Return True when two YouTube titles are probably the same song."""
+        a = cls._norm_title(a)
+        b = cls._norm_title(b)
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        # Catch titles such as "Song | Artist" vs "Song - Official Audio".
+        if len(a) >= 12 and len(b) >= 12 and (a in b or b in a):
+            return True
+        at, bt = set(a.split()), set(b.split())
+        if len(at) >= 3 and len(bt) >= 3:
+            overlap = len(at & bt) / min(len(at), len(bt))
+            if overlap >= 0.80:
+                return True
+        return SequenceMatcher(None, a, b).ratio() >= 0.84
+
+    @staticmethod
+    def _detect_language_hint(context: str = "", title: str = "", channel: str = "") -> str | None:
+        """Detect the music language/scene used for autoplay searches.
+
+        Explicit language words in the original search have highest priority.
+        Bhojpuri gets a strong dedicated hint so a Bhojpuri session keeps
+        returning Bhojpuri songs instead of drifting into generic Hindi.
+        """
+        text = f"{context} {title} {channel}".lower()
+
+        language_keywords = {
+            "bhojpuri": [
+                "bhojpuri", "भोजपुरी", "bhojpuriya", "bhojpuri song",
+                "bhojpuri songs", "bhojpuri gana", "bhojpuri gaana",
+                "pawan singh", "khesari lal", "khesari lal yadav",
+                "ritesh pandey", "shilpi raj", "pramod premi",
+                "neelkamal singh", "arvind akela kallu", "ankush raja",
+                "gunjan singh", "rajesh raja", "rakesh mishra",
+            ],
+            "punjabi": ["punjabi", "ਪੰਜਾਬੀ", "sidhu moose wala", "karan aujla", "diljit dosanjh", "amrit maan"],
+            "haryanvi": ["haryanvi", "हरियाणवी", "haryanavi", "sapna choudhary", "gulzaar chhaniwala", "masoom sharma"],
+            "rajasthani": ["rajasthani", "राजस्थानी", "marwadi", "मारवाड़ी"],
+            "marathi": ["marathi", "मराठी", "marathi song", "marathi songs"],
+            "bengali": ["bengali", "বাংলা", "bangla song", "bengali song", "bengali songs"],
+            "tamil": ["tamil", "தமிழ்", "tamil song", "tamil songs"],
+            "telugu": ["telugu", "తెలుగు", "telugu song", "telugu songs"],
+            "kannada": ["kannada", "ಕನ್ನಡ", "kannada song", "kannada songs"],
+            "malayalam": ["malayalam", "മലയാളം", "malayalam song", "malayalam songs"],
+            "odia": ["odia", "oriya", "ଓଡ଼ିଆ", "odia song", "odia songs"],
+            "assamese": ["assamese", "অসমীয়া", "assamese song", "assamese songs"],
+            "gujarati": ["gujarati", "ગુજરાતી", "gujarati song", "gujarati songs"],
+            "hindi": ["hindi", "हिंदी", "hindi song", "hindi songs"],
+        }
+
+        # Explicit Bhojpuri markers first.
+        for word in language_keywords["bhojpuri"]:
+            if word in text:
+                return "Bhojpuri"
+
+        # Other regional-language markers.
+        for lang, words in language_keywords.items():
+            if lang == "bhojpuri":
+                continue
+            for word in words:
+                if word in text:
+                    return lang.title()
+
+        # Devanagari is useful as a Hindi/Bhojpuri fallback, but don't call it
+        # Bhojpuri without a Bhojpuri-specific marker.
+        if re.search(r"[\u0900-\u097F]", text):
+            return "Hindi"
+
+        return None
+
+    async def _related_from_search(
+        self, current: Track, played: set[str], played_titles: set[str],
+        context_query: str | None = None,
+    ) -> Track | None:
+        """Find a genuinely different autoplay song.
+
+        Do not rely on the first YouTube result. Search several candidates and
+        reject both previously-used IDs and titles that are merely another
+        upload/remix of a song already played.
+        """
+        title = (current.title or "").strip()
+        channel = (current.channel_name or "").strip()
+
+        # Keep autoplay in the same language/scene as the user's original
+        # search. Never fall back to a hard-coded Hindi query.
+        context = (context_query or "").strip()
+        language_hint = self._detect_language_hint(context, title, channel)
+        queries = []
+
+        if language_hint:
+            if context:
+                queries.append(f"{context} {language_hint} songs")
+            if title:
+                queries.append(f"{title} {language_hint} song")
+            if channel:
+                queries.append(f"{channel} {language_hint} songs")
+            queries.append(f"best {language_hint} songs")
+        else:
+            if context:
+                queries.append(f"{context} songs")
+            if channel:
+                queries.append(f"{channel} songs")
+                queries.append(f"{channel} best songs")
+            if title:
+                queries.append(f"{title} similar songs")
+
+        # Always keep a useful title/channel fallback even if the language
+        # detector did not recognize the query.
+        if not queries:
+            if title:
+                queries.append(f"{title} similar songs")
+            if channel:
+                queries.append(f"{channel} songs")
+
+        queries = list(dict.fromkeys(q.strip() for q in queries if q.strip()))
+
+        current_id = str(current.id)
+        played_ids = {str(x) for x in played}
+        played_ids.add(current_id)
+        blocked_titles = {
+            self._norm_title(x) for x in (played_titles or set()) if x
+        }
+        current_norm = self._norm_title(title)
+        if current_norm:
+            blocked_titles.add(current_norm)
+
+        candidates = []
+        seen_ids = set(played_ids)
+        seen_titles = set(blocked_titles)
+
+        for query in queries:
+            try:
+                results = await VideosSearch(query, limit=20).next()
+            except Exception as e:
+                logger.warning(f"[Autoplay] Search failed for {query!r}: {e!r}")
+                continue
+
+            for data in (results or {}).get("result", []):
+                eid = str(data.get("id") or "")
+                if not eid or eid in seen_ids:
+                    continue
+
+                result_title = (data.get("title") or "Unknown").strip()
+                norm = self._norm_title(result_title)
+                if not norm or self._same_song(result_title, title):
+                    continue
+
+                # Compare against every played title, not just exact strings.
+                if any(self._same_song(result_title, old) for old in blocked_titles):
+                    continue
+
+                duration_str = data.get("duration")
+                duration_sec = utils.to_seconds(duration_str) if duration_str else 0
+                if not duration_sec or duration_sec > config.DURATION_LIMIT:
+                    continue
+
+                seen_ids.add(eid)
+                seen_titles.add(norm)
+                thumbs = data.get("thumbnails") or []
+                thumbnail = (thumbs[-1].get("url") or "").split("?")[0] if thumbs else None
+                candidates.append(
                     Track(
-                        id=vidid,
-                        title=r.get("title", "Unknown Track"),
-                        url=r.get("link", self.base + vidid),
-                        duration=duration_min,
+                        id=eid,
+                        channel_name=data.get("channel", {}).get("name") or "YouTube",
+                        duration=duration_str,
                         duration_sec=duration_sec,
-                        thumbnail=(r.get("thumbnails") or [{}])[0].get("url", "").split("?")[0],
-                        channel_name=(r.get("channel") or {}).get("name", ""),
-                        message_id=0,
+                        title=result_title[:80],
+                        thumbnail=thumbnail,
+                        url=data.get("link"),
+                        view_count=data.get("viewCount", {}).get("short"),
                         video=False,
-                        time=int(_time.time()),
                     )
                 )
-            return tracks
-        except Exception as e:
-            logger.warning("search_similar_candidates error for '%s': %s", query, e)
-            return []
 
-    async def _store_in_dump(self, file_path: str, video_id: str, is_video: bool = False) -> None:
-        """Upload downloaded track to STORAGE_GROUP_ID and save file_id + shared msg_id in MongoDB."""
-        try:
-            from ishu import app, db
-            storage_id = getattr(config, "STORAGE_GROUP_ID", 0) or getattr(config, "LOGGER_ID", 0)
-            if not storage_id:
-                return
-
-            if is_video:
-                msg = await app.send_video(storage_id, video=file_path, caption=f"#VIDEO #{video_id}")
-                file_id = msg.video.file_id if msg and msg.video else None
-            else:
-                msg = await app.send_audio(storage_id, audio=file_path, caption=f"#AUDIO #{video_id}")
-                file_id = msg.audio.file_id if msg and msg.audio else None
-
-            if msg and msg.id:
-                if file_id:
-                    await db.save_song_file_id(video_id, file_id, is_video)
-                await db.save_shared_song(video_id, msg.id, is_video)
-                logger.info("Stored %s in dump channel (%s) -> msg_id: %s", video_id, storage_id, msg.id)
-        except Exception as e:
-            logger.warning("Failed to store %s in dump channel: %s", video_id, e)
-
-
-    async def _raw_cold_download(self, video_id: str, video: bool = False) -> str | None:
-        """Internal helper for cold YouTube download when cache is completely missing."""
-        link = _normalize_youtube_link(video_id, self.base)
-        try:
-            result, downloader = await _download_with_fallback(
-                link, "video" if video else "audio"
-            )
-            if result:
-                self.dl_stats[downloader] = self.dl_stats.get(downloader, 0) + 1
-                logger.info(
-                    "Cold YouTube.download success: %s (%s) via %s",
-                    video_id,
-                    "video" if video else "audio",
-                    downloader,
-                )
-            else:
-                self.dl_stats["failed"] += 1
-            return result
-        except Exception as e:
-            self.dl_stats["failed"] += 1
-            logger.warning("Cold YouTube.download error for '%s': %s", video_id, e)
+        if not candidates:
             return None
 
-    # ── Download (main method called by play.py / calls.py) ──────────────────
-    async def download(
+        # Prefer candidates whose title/channel explicitly matches the
+        # detected language. Unknown-language metadata is still allowed so
+        # autoplay does not become too restrictive.
+        if language_hint:
+            def score(track):
+                text = f"{track.title or ''} {track.channel_name or ''}"
+                detected = self._detect_language_hint(title=track.title or "", channel=track.channel_name or "")
+                return 1 if detected == language_hint else 0
+            candidates.sort(key=score, reverse=True)
+            best_score = score(candidates[0])
+            top = [c for c in candidates if score(c) == best_score]
+            random.shuffle(top)
+            return top[0]
+
+        random.shuffle(candidates)
+        return candidates[0]
+
+    async def get_related(
         self,
-        video_id: str,
-        video: bool = False,
-        title: str | None = None,
-    ) -> str | None:
+        current: Track,
+        played: list[str] | None = None,
+        played_titles: set[str] | None = None,
+        context_query: str | None = None,
+    ) -> Track | None:
+        """Return a new autoplay song, never a previously played song.
+
+        Search is intentionally attempted before YouTube's RD mix because RD
+        frequently returns another upload of the exact same song on cloud IPs.
+        The mix remains a fallback, with the same duplicate filtering.
         """
-        Download audio/video by video_id using ultra-fast HybridCacheManager.
-        Priority: Local SSD (50-300ms) -> Telegram Dump Backup (1-3s) -> Cold YT Download (5-20s).
-        Returns file path or None.
-        """
-        from ishu.core.cache_manager import cache_manager
+        if not current or not current.id:
+            return None
 
-        self.dl_stats["total_requests"] += 1
+        played = {str(x) for x in (played or [])}
+        played.add(str(current.id))
+        played_titles = set(played_titles or set())
+        if current.title:
+            played_titles.add(current.title)
 
-        async def _dl_wrapper(vid: str, is_vid: bool):
-            return await self._raw_cold_download(vid, is_vid)
-
-        return await cache_manager.get_or_fetch(
-            video_id=video_id,
-            title=title or "",
-            duration=0,
-            is_video=video,
-            downloader_fn=_dl_wrapper,
+        related = await self._related_from_search(
+            current, played, played_titles, context_query=context_query
         )
+        if related:
+            if related.id and context_query:
+                self.track_context[str(related.id)] = context_query
+            return related
 
-    async def prefetch_song(
-        self,
-        video_id: str,
-        title: str | None = None,
-        video: bool = False,
-    ) -> None:
-        """Background prefetch for upcoming songs in queue."""
-        from ishu.core.cache_manager import cache_manager
-
-        async def _dl_wrapper(vid: str, is_vid: bool):
-            return await self._raw_cold_download(vid, is_vid)
-
-        await cache_manager.prefetch_song(
-            video_id=video_id,
-            title=title or "",
-            is_video=video,
-            downloader_fn=_dl_wrapper,
+        logger.info(
+            f"[Autoplay] Search returned no unique track for {current.id}, trying RD mix."
         )
+        language_hint = self._detect_language_hint(
+            context_query or self.track_context.get(str(current.id), ""),
+            current.title or "",
+            current.channel_name or "",
+        )
+        related = await self._related_from_mix(
+            current.id,
+            played,
+            {self._norm_title(x) for x in played_titles if x},
+            language_hint=language_hint,
+        )
+        if related and not self._same_song(related.title, current.title):
+            if related.id and context_query:
+                self.track_context[str(related.id)] = context_query
+            return related
 
-    # ── Playlist ──────────────────────────────────────────────────────────────
-    async def playlist(
-        self,
-        limit: int,
-        mention: str,
-        link: str,
-        video: bool = False,
-    ) -> list:
-        """Fetch playlist tracks, return list of Track dataclasses."""
-        from ishu.helpers._dataclass import Track
+        logger.warning(f"[Autoplay] No unique related track found for {current.id}.")
+        return None
 
-        link = _normalize_youtube_link(link)
-        try:
-            plist = await Playlist.get(link)
-        except Exception:
-            return []
+        played = {str(x) for x in (played or [])}
+        played.add(str(current.id))
+        played_titles = {
+            re.sub(r"\W+", " ", str(x).lower()).strip()
+            for x in (played_titles or set())
+            if x
+        }
+        current_title = re.sub(
+            r"\W+", " ", str(current.title or "").lower()
+        ).strip()
+        if current_title:
+            played_titles.add(current_title)
 
-        tracks = []
-        for data in (plist.get("videos") or [])[:limit]:
-            if not data:
-                continue
-            vidid = data.get("id")
-            if not vidid:
-                continue
-            duration_min = data.get("duration") or "00:00"
-            duration_sec = int(utils.to_seconds(duration_min)) if duration_min else 0
-            thumbs       = data.get("thumbnails") or []
-            thumbnail    = thumbs[0].get("url", "").split("?")[0] if thumbs else ""
-            view_count = None
-            if "viewCount" in data and isinstance(data["viewCount"], dict):
-                view_count = data["viewCount"].get("short") or data["viewCount"].get("text")
-            channel_name = (data.get("channel") or {}).get("name", "")
-            tracks.append(Track(
-                id           = vidid,
-                title        = data.get("title") or vidid,
-                url          = data.get("link") or self.base + vidid,
-                duration     = duration_min,
-                duration_sec = duration_sec,
-                thumbnail    = thumbnail,
-                user         = mention,
-                video        = video,
-                time         = int(_time.time()),
-                view_count   = view_count,
-                channel_name = channel_name,
-            ))
-        return tracks
+        related = await self._related_from_mix(current.id, played, played_titles)
+        if related:
+            return related
+
+        logger.info(
+            f"[Autoplay] Mix returned nothing for {current.id}, trying search fallback."
+        )
+        related = await self._related_from_search(current, played, played_titles)
+        if related:
+            return related
+
+        logger.warning(f"[Autoplay] No related track found for {current.id}.")
+        return None
+        
