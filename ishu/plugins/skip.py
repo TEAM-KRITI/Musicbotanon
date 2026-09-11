@@ -1,7 +1,7 @@
 from pyrogram import filters, types
 
-from ArchonMusic import ArchonMusic, app, db, lang
-from ArchonMusic.helpers import can_manage_vc
+from ishu import ArchonMusic, app, db, lang
+from ishu.helpers import can_manage_vc
 
 
 @app.on_message(filters.command(["skip", "next"]) & filters.group & ~app.bl_users)
