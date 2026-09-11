@@ -1,6 +1,6 @@
 from pyrogram import filters, types
 
-from ishu import ArchonMusic, app, db, lang
+from ishu import ishu, app, db, lang
 from ishu.helpers import can_manage_vc
 
 
