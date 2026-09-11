@@ -9,9 +9,9 @@ from pyrogram.types import InputMediaPhoto, Message
 from pytgcalls import PyTgCalls, exceptions, types
 from pytgcalls.pytgcalls_session import PyTgCallsSession
 
-from ArchonMusic import (app, config, db, lang, logger,
+from ishu import (app, config, db, lang, logger,
                    queue, thumb, userbot, yt)
-from ArchonMusic.helpers import Media, Track, buttons
+from ishu.helpers import Media, Track, buttons
 
 
 async def _noop():
